@@ -172,3 +172,5 @@ math-dataset
 eval_vllm_counterpart
 output
 wandb
+
+log.txt
