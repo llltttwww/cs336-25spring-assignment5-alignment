@@ -174,3 +174,4 @@ output
 wandb
 
 log.txt
+loss.txt

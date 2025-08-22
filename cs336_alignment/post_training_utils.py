@@ -473,7 +473,9 @@ def compute_grpo_clip_loss(
     log_probs_ratio=torch.exp(log_probs_ratio)
     
     unclipped_term=log_probs_ratio*advantages
-    clipped_term=torch.clamp(log_probs_ratio,1-cliprange,1+cliprange)*advantages
+    clipped_term=log_probs_ratio*advantages
+    if cliprange is not None:
+        clipped_term=torch.clamp(log_probs_ratio,1-cliprange,1+cliprange)*advantages
     
     loss=-torch.min(unclipped_term,clipped_term)
     
@@ -568,6 +570,7 @@ def grpo_microbatch_train_step(
     
     loss,metadata=compute_policy_gradient_loss(policy_log_probs,loss_type,raw_rewards,advantages,old_log_probs,cliprange)
     loss = masked_mean(loss, response_mask, dim=-1)  # average over sequence length
+    # loss=masked_normalize(loss,response_mask,normalize_constant=loss.shape[1],dim=-1)
     loss=loss.mean() / gradient_accumulation_steps  # average over batch and normalize by accumulation steps
     loss.backward()
     return loss,metadata

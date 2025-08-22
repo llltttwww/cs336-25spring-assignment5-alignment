@@ -1,6 +1,6 @@
 import os
 os.environ['HF_HOME'] = os.getenv('HF_HOME', '/workspace/home/luotianwei/hf_cache')
-os.environ['CUDA_VISIBLE_DEVICES']="1,2"
+os.environ['CUDA_VISIBLE_DEVICES']="4,5"
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Literal
@@ -61,9 +61,6 @@ from cs336_alignment.datasets import MathDataset
 def format_r1_batch(qs: List[str]) -> List[str]:
     return [R1_ZERO_PROMPT.format(question=q.strip()) for q in qs]
 
-# -------------------------
-# 配置
-# -------------------------
 @dataclass
 class Config:
     # data
@@ -79,7 +76,7 @@ class Config:
 
     # optimization
     n_grpo_steps: int = 600
-    learning_rate: float = 1e-5
+    learning_rate: float = 2.5e-5
     weight_decay: float = 0.0
     betas: Tuple[float, float] = (0.9, 0.95)
     gradient_accumulation_steps: int = 128
@@ -106,7 +103,7 @@ class Config:
 
     # logging
     project: str = "cs336-grpo"
-    run_name: Optional[str] = "standard_setting"
+    run_name: Optional[str] = "lr=2.5e-5__from_sft"
     eval_every: int = 10
     seed: int = 1234
     max_eval_size: int=1000
@@ -114,9 +111,6 @@ class Config:
 
 app = typer.Typer(add_completion=False)
 
-# -------------------------
-# 主训练循环
-# -------------------------
 @app.command()
 def train(
     cfg_path: Optional[str] = typer.Option(None, help="可选：加载 JSON 配置文件"),
@@ -125,13 +119,11 @@ def train(
         help='JSON 字符串覆盖配置，如：\'{"learning_rate":5e-5,"loss_type":"reinforce_with_baseline"}\'',
     ),
 ):
-    # ---- 配置合并 ----
     cfg = Config()
     if cfg_path:
         cfg_dict = json.loads(Path(cfg_path).read_text())
         cfg = Config(**{**cfg.__dict__, **cfg_dict})
 
-    # 解析 --override
     if override:
         try:
             upd = json.loads(override)
@@ -142,19 +134,16 @@ def train(
                 raise typer.BadParameter(f"未知配置项：{k}")
             setattr(cfg, k, v)
 
-    # ---- 派生量检查 ----
     assert cfg.train_batch_size % cfg.gradient_accumulation_steps == 0
     micro_train_batch_size = cfg.train_batch_size // cfg.gradient_accumulation_steps
     n_train_steps_per_rollout_batch=cfg.rollout_batch_size*cfg.epochs_per_rollout_batch // cfg.train_batch_size
     assert cfg.rollout_batch_size % cfg.group_size == 0
     n_prompts_per_rollout = cfg.rollout_batch_size // cfg.group_size
 
-    # ---- 随机种子 ----
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     random.seed(cfg.seed)
 
-    # ---- HF 模型 (训练用) ----
     dtype = dict(float16=torch.float16, bfloat16=torch.bfloat16, float32=torch.float32)[cfg.dtype]
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
@@ -174,10 +163,8 @@ def train(
         weight_decay=cfg.weight_decay,
     )
 
-    # ---- vLLM 模型 (rollout 用) ----
     llm = init_vllm(cfg.model_id, device="cuda:1", seed=cfg.seed)
 
-    # ---- 数据 ----
     train_prompts, train_gts = load_jsonl(Path(cfg.train_path))
     val_prompts, val_gts = load_jsonl(Path(cfg.val_path), limit=cfg.val_size)
     # val_dataset = list(zip(val_prompts, val_gts))  # 包装成简单 dataset
@@ -209,15 +196,13 @@ def train(
 
     global_train_step=0
     for global_step in step_bar:
-        # === 采样一个 rollout batch 的 prompts ===
         idxs = random.sample(range(len(train_prompts)), n_prompts_per_rollout)
         prompts_batch = [train_prompts[i] for i in idxs]
         prompts_batch = format_r1_batch(prompts_batch)
         gts_batch = [train_gts[i] for i in idxs]
 
-        # === vLLM rollout ===
         model.eval()
-        load_policy_into_vllm_instance(model, llm)  # 同步最新参数到 vLLM
+        load_policy_into_vllm_instance(model, llm)  
         responses = batched_generate_vllm(
             llm=llm,
             prompts=prompts_batch,
@@ -228,11 +213,9 @@ def train(
             top_p=cfg.top_p,
         )
 
-        # 展开 ground truth
         repeated_gts = [gt for gt in gts_batch for _ in range(cfg.group_size)]
         repeated_prompts = [p for p in prompts_batch for _ in range(cfg.group_size)]
 
-        # === 计算 rewards/advantages（分组归一化）===
         advantages, raw_rewards, rew_meta = compute_group_normalize_rewards(
             reward_fn=r1_zero_reward_fn,
             rollout_responses=responses,
@@ -241,15 +224,8 @@ def train(
             advantage_eps=cfg.advantage_eps,
             normalize_by_std=cfg.use_std_normalization,
         )
-        # (B,) -> (B,1) 便于与 token 维广播
         advantages = advantages.to(model.device).unsqueeze(-1)
         raw_rewards = raw_rewards.to(model.device).unsqueeze(-1)
-
-        # # === 计算 old_log_probs + response_mask（用于 off-policy 的 grpo_clip；on-policy也可留档）===
-        # with torch.no_grad():
-        #     old_log_probs, response_mask = policy_response_log_probs(
-        #         model, tokenizer, repeated_prompts, responses, padding_side=cfg.pad_side
-        #     )  # shapes: (B,T), (B,T bool)
 
         tokenized_dict= tokenize_prompt_and_output(
             prompt_strs=repeated_prompts,
@@ -260,8 +236,6 @@ def train(
         input_ids=tokenized_dict['input_ids'].to(model.device) # (B,T-1)
         labels=tokenized_dict['labels'].to(model.device) #(B,T-1)
         response_mask=tokenized_dict['response_mask'].to(model.device) #(B,T-1)
-        # ===== 把 rollout 打包成 "old_rollout" 缓存 =====
-        # 注意：prompts/responses 是 python list，其他是 tensor；放到同一 device 便于训练期切片
         old_log_probs = None
         if cfg.loss_type == "grpo_clip":
             pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
@@ -290,10 +264,8 @@ def train(
         }
         num_samples = len(old_rollout["prompts"])
 
-        # === 进入 "train_epochs"：用 train_batch_size 从 old_rollout 取 batch 进行更新 ===
         model.train()
 
-        # 1) 索引放 CPU，避免 CPU 张量用 CUDA 索引
         indices = torch.randperm(num_samples)  # CPU
 
         for epoch_in_batch in range(cfg.epochs_per_rollout_batch):
@@ -305,23 +277,19 @@ def train(
                 batch_idx_cpu = indices[start:end]                    # CPU long tensor
                 batch_idx_list = batch_idx_cpu.tolist()
 
-                # 2) 文本依然只是为了调试/日志，训练不需要搬 GPU
                 batch_prompts_list   = [old_rollout["prompts"][i]   for i in batch_idx_list]
                 batch_responses_list = [old_rollout["responses"][i] for i in batch_idx_list]
 
-                # 3) 大张量保持在 CPU；不要提前 .to(model.device)
                 batch_input_ids_cpu      = old_rollout["input_ids"][batch_idx_cpu]         # (B, T-1) CPU
                 batch_labels_cpu         = old_rollout["labels"][batch_idx_cpu]            # (B, T-1) CPU
                 batch_response_mask_cpu  = old_rollout["response_mask"][batch_idx_cpu]     # (B, T-1) CPU (bool)
                 batch_advantages_cpu     = old_rollout["advantages"][batch_idx_cpu]        # (B, 1) CPU
                 batch_rewards_cpu        = old_rollout["raw_rewards"][batch_idx_cpu]       # (B, 1) CPU
 
-                # old_log_probs 只有在 grpo_clip 时才有；否则保持 None
                 batch_old_log_probs_cpu = None
                 if (old_rollout.get("old_log_probs") is not None) and (cfg.loss_type == "grpo_clip"):
                     batch_old_log_probs_cpu = old_rollout["old_log_probs"][batch_idx_cpu]  # (B, T-1) CPU
 
-                # 4) 动态 micro 切分
                 batch_size_now = batch_input_ids_cpu.size(0)
                 micro_batch_size  = math.ceil(batch_size_now / cfg.gradient_accumulation_steps)
                 num_micro_steps   = math.ceil(batch_size_now / micro_batch_size)
@@ -333,7 +301,6 @@ def train(
                     micro_start = micro_step * micro_batch_size
                     micro_end   = min(micro_start + micro_batch_size, batch_size_now)
 
-                    # 5) 仅把当前 micro 切片搬到 GPU
                     input_ids_micro      = batch_input_ids_cpu[micro_start:micro_end].to(model.device, non_blocking=True)
                     labels_micro         = batch_labels_cpu[micro_start:micro_end].to(model.device, non_blocking=True)
                     response_mask_micro  = batch_response_mask_cpu[micro_start:micro_end].to(model.device, non_blocking=True)
@@ -343,20 +310,17 @@ def train(
                     if batch_old_log_probs_cpu is not None:
                         old_log_probs_micro = batch_old_log_probs_cpu[micro_start:micro_end].to(model.device, non_blocking=True)
 
-                    # # 建议传入 attention_mask
-                    # attention_mask_micro = (input_ids_micro != tokenizer.pad_token_id).long()
-
-                    # 当前策略 log-probs（需要梯度）
                     current_out = get_response_log_probs(
                         model=model,
                         input_ids=input_ids_micro,
                         labels=labels_micro,
-                        return_token_entropy=False,
+                        return_token_entropy=True,
                         # attention_mask=attention_mask_micro,
                     )
                     current_log_probs = current_out["log_probs"]  # (b, T-1)
+                    current_token_entropy=current_out["token_entropy"]  # (b, T-1)
+                    mean_token_entropy = masked_mean(current_token_entropy, response_mask_micro)  # (b,)
 
-                    # 6) 选择损失（old_log_probs 仅在 grpo_clip 使用）
                     loss_tensor, _ = grpo_microbatch_train_step(
                         policy_log_probs=current_log_probs,
                         response_mask=response_mask_micro,
@@ -367,22 +331,27 @@ def train(
                         old_log_probs=old_log_probs_micro,
                         cliprange=cfg.cliprange if cfg.loss_type == "grpo_clip" else None,
                     )
-
+                    # with open("loss.txt", "a") as f:
+                    #     f.write(f"#######\n{loss_tensor.item()}\n")
+                    #     f.write(f"{total_loss_value}\n")
                     total_loss_value += float(loss_tensor.detach().cpu())
 
                 clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 optimizer.step()
+            
+                # with open("loss.txt", "a") as f:
+                #     f.write(f"\n@@@@@\n{total_loss_value}\n@@@@@\n\n")
 
                 wandb.log({
                     "train/loss": total_loss_value,
                     "train/reward_mean": float(rew_meta["mean_reward"]),
                     "train/reward_std": float(rew_meta["std_reward"]),
                     "train/epoch_in_rollout": epoch_in_batch,
+                    "train/mean_token_entropy":mean_token_entropy.item(),
                     "global_train_step":global_train_step,
                 })
                 global_train_step+=1
 
-        # === 周期性验证 ===
         if (global_step + 1) % cfg.eval_every == 0:
             model.eval()
             eval_vllm_model(
